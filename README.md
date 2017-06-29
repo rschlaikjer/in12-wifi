@@ -19,7 +19,9 @@ died after a few years continuous service, I resolved to build a second
 generation design with two improvements - a seconds place, and wifi enabled to
 avoid yet another cable snaking across the desk.
 
-![Picture](/Media/counting.gif?raw=true "In operation")
+<p align="center">
+<img src="/Media/counting.gif?raw=true">
+</p>
 
 The design is split into three PCBs:
 - The control board has three sections - one for the boost logic (12V -> 170V),
