@@ -4,7 +4,17 @@
 #include <Time.h>
 #include <Timezone.h>
 
-// High tension system enable
+#define DEBUG 1
+
+#if DEBUG
+  #define LOG(X) Serial.print(X);
+  #define LOGLN(X) Serial.println(X);
+#else
+  #define LOG(X)
+  #define LOGLN(X)
+#endif
+
+// High voltage system enable
 #define HV_EN 6
 
 // Wifi control
@@ -21,19 +31,33 @@
 
 // How long between NTP re-sync's (millis)
 #define NTP_SYNC_INTERVAL 600000
+// How long between NTP retrys (millis)
+#define NTP_RESEND_INTERVAL 2000
+
+// How long to wait for wifi to connect
+#define WIFI_RECONNECT_INTERVAL 10000
 
 // How long between display updates (millis)
-#define DISPLAY_UPDATE_INTERVAL 50
+#define DISPLAY_UPDATE_INTERVAL 100
+
+#define TIME_SERVER "time.nist.gov"
+#define NTP_PORT 123
+#define LOCAL_PORT 2390
 
 // Wifi details
-char ssid[] = "your_ssid_here";
-char pass[] = "your_password_here";
+#define MAX_SSID_LEN 64
+boolean ssidLoaded = false;
+uint8_t EEMEM_SSID_LEN EEMEM = 0;
+uint8_t EEMEM_PASS_LEN EEMEM = 0;
+char EEMEM_SSID[MAX_SSID_LEN] EEMEM = "your_ssid_here";
+char EEMEM_PASS[MAX_SSID_LEN] EEMEM = "your_password_here";
+char ssid[MAX_SSID_LEN] = {0};
+char pass[MAX_SSID_LEN] = {0};
 
 // WIFI101 internals
 WiFiUDP Udp;
-int status = WL_IDLE_STATUS;
-IPAddress timeServer(129, 6, 15, 28); // time.nist.gov NTP server
-unsigned int localPort = 2390;
+int wifiStatus = WL_IDLE_STATUS;
+unsigned long lastWifiBeginTime = WIFI_RECONNECT_INTERVAL;
 const int NTP_PACKET_SIZE = 48;
 byte packetBuffer[NTP_PACKET_SIZE];
 
@@ -44,13 +68,17 @@ Timezone usEastern(usEDT, usEST);
 
 // State
 unsigned long millis_offset = 0;
-unsigned long lastNtpSync = 0;
+unsigned long lastNtpPacketSent = NTP_RESEND_INTERVAL;
+unsigned long lastNtpSyncSuccess = NTP_SYNC_INTERVAL;
 unsigned long lastDisplayUpdate = 0;
 
 /**
  * Set pinmodes, initialize WiFi chipset, enable the high voltage system
  */
 void setup() {
+    // Initialize serial
+    Serial.begin(9600);
+
     //// Set up pins
     // High voltage shutdown
     pinMode(HV_EN, OUTPUT);
@@ -72,13 +100,10 @@ void setup() {
     digitalWrite(WIFI_EN, HIGH);
     delay(250);
     WiFi.setPins(WIFI_SS, WIFI_IRQ, WIFI_RESET, -1);
-    initWifi();
 
     // Turn on display
+    write595Time(0, 0, 0);
     digitalWrite(HV_EN, HIGH);
-
-    // Fetch initial offset
-    sendNTPpacket(timeServer);
 }
 
 /**
@@ -88,15 +113,22 @@ void setup() {
  * - Whether it's time to update the display
  */
 void loop() {
+    // Ensure that the wifi remains connected
+    ensureWifi();
+
     // If it's been more than NTP_SYNC_INTERVAL since we last updated our time
     // offset, then issue a new NTP sync request.
-    if (millis() - lastNtpSync > NTP_SYNC_INTERVAL) {
-        lastNtpSync = millis();
-        sendNTPpacket(timeServer);
+    if (WiFi.status() == WL_CONNECTED
+     && millis() - lastNtpSyncSuccess > NTP_SYNC_INTERVAL
+     && millis() - lastNtpPacketSent > NTP_RESEND_INTERVAL) {
+        LOGLN("Sending new NTP packet");
+        sendNTPpacket();
+        lastNtpPacketSent = millis();
     }
 
     // If we have a pending NTP response datagram, handle it
     if (Udp.parsePacket()) {
+        LOGLN("Got NTP response");
         parseNtpResponse();
     }
 
@@ -105,6 +137,84 @@ void loop() {
         lastDisplayUpdate = millis();
         updateDisplay();
     }
+
+    while (Serial.available()) {
+        handleSerial();
+    }
+}
+
+#define READY 1
+#define READ_SSID 2
+#define READ_PASS 3
+
+uint8_t serialState = READY;
+
+char serialBuffer[96];
+uint8_t cmdBufferIndex = 0;
+
+void handleSerial() {
+    // Read the next character
+    int c = Serial.read();
+
+    // If we read a -1, there's no data available
+    if (c < 0) {
+      return;
+    }
+
+    Serial.print(((char)c));
+
+    // Handle the byte depending on our current state
+    switch(serialState) {
+        case READY:
+            // Add the char to the command buffer
+            serialBuffer[cmdBufferIndex++] = c;
+
+            // If the buffer has 4 characters, check if it's a valid command
+            if (cmdBufferIndex == 5) {
+                if (!strncmp("ssid ", serialBuffer, 5)) {
+                  serialState = READ_SSID;
+                } else if (!strncmp("pass ", serialBuffer, 5)) {
+                  serialState = READ_PASS;
+                } else {
+                  serialState = READY;
+                  Serial.println("Invalid cmd");
+                }
+                cmdBufferIndex = 0;
+            }
+            break;
+        case READ_PASS:
+            if (c == '\n' || c == '\r') {
+                serialBuffer[cmdBufferIndex++] = 0;
+                setWifiPass(serialBuffer, cmdBufferIndex);
+                Serial.print("Set Wifi pass to ");
+                Serial.println(serialBuffer);
+                cmdBufferIndex = 0;
+                serialState = READY;
+            }
+            serialBuffer[cmdBufferIndex++] = c;
+            break;
+        case READ_SSID:
+            if (c == '\n' || c == '\r') {
+                serialBuffer[cmdBufferIndex++] = 0;
+                setWifiSsid(serialBuffer, cmdBufferIndex);
+                Serial.print("Set Wifi ssid to ");
+                Serial.println(serialBuffer);
+                cmdBufferIndex = 0;
+                serialState = READY;
+            }
+            serialBuffer[cmdBufferIndex++] = c;
+            break;
+    }
+}
+
+void setWifiSsid(char *newSSID, uint8_t len) {
+    eeprom_write_block(newSSID, EEMEM_SSID, len);
+    eeprom_write_byte(&EEMEM_SSID_LEN, len);
+}
+
+void setWifiPass(char *newPass, uint8_t len) {
+    eeprom_write_block(newPass, EEMEM_PASS, len);
+    eeprom_write_byte(&EEMEM_PASS_LEN, len);
 }
 
 /**
@@ -119,21 +229,45 @@ void updateOffset(unsigned long localTime) {
  * Initialize the WiFi chipset,
  * internal millisecond counter.
  */
-void initWifi() {
-    // Check if the WiFi chipset is actually presenty
-    if (WiFi.status() == WL_NO_SHIELD) {
-        // If not, lock up
-        while (true);
+void ensureWifi() {
+    // If the wifi is connected, and we thought it was connected, do nothing
+    if (WiFi.status() == WL_CONNECTED && wifiStatus == WL_CONNECTED) {
+        return;
     }
 
-    // Loop until we successfully connect to the network
-    while (status != WL_CONNECTED) {
-        status = WiFi.begin(ssid, pass);
-        delay(10000);
+    // Check if we have loaded the SSID details from EEPROM
+    if (!ssidLoaded) {
+        uint8_t ssidLen = eeprom_read_byte(&EEMEM_SSID_LEN);
+        LOG("SSid length: ");
+        LOGLN(ssidLen);
+        uint8_t passLen = eeprom_read_byte(&EEMEM_PASS_LEN);
+        LOG("Pass length: ");
+        LOGLN(passLen);
+        eeprom_read_block(ssid, EEMEM_SSID, ssidLen);
+        eeprom_read_block(pass, EEMEM_PASS, passLen);
+        LOG("Loaded wifi details ");
+        LOG(ssid);
+        LOG(" / ");
+        LOGLN(pass);
+        ssidLoaded = true;
     }
 
-    // Start up our UDP socket
-    Udp.begin(localPort);
+    // If we're not connected, and it's been long enough since the last attempt,
+    // re-begin the wifi connection.
+    if (millis() - lastWifiBeginTime > WIFI_RECONNECT_INTERVAL) {
+        lastWifiBeginTime = millis();
+        LOG("(Re)Connecting to WiFi");
+        wifiStatus = WiFi.begin(ssid, pass);
+    }
+
+    // If the wifi is connected but we didn't think it was, then we must just have
+    // connected, so start a UDP socket up.
+    if (wifiStatus == WL_CONNECTED || WiFi.status() == WL_CONNECTED) {
+        LOG("Wifi connected");
+        wifiStatus = WL_CONNECTED;
+        Udp.begin(LOCAL_PORT);
+        return;
+    }
 }
 
 /**
@@ -158,9 +292,13 @@ void parseNtpResponse() {
 
     // Now, convert that epoch to our local timezone
     unsigned long localTime =  usEastern.toLocal(epoch);
+    LOG("Updated time offset: ");
+    LOGLN(localTime);
 
     // And update our millisecond offset
     updateOffset(localTime);
+
+    lastNtpSyncSuccess = millis();
 }
 
 
@@ -169,7 +307,7 @@ void parseNtpResponse() {
  * This involves building up a packet by hand - reference to RFC5905 is key
  * https://tools.ietf.org/html/rfc5905#section-7.3
  */
-unsigned long sendNTPpacket(IPAddress& address) {
+unsigned long sendNTPpacket() {
     // Zero out our packet buffer
     memset(packetBuffer, 0, NTP_PACKET_SIZE);
 
@@ -211,7 +349,7 @@ unsigned long sendNTPpacket(IPAddress& address) {
     // There are more fields in an NTP packet, but we don't care about them here
     // Now that the packet is all set, we can send it off to the timeserver
     // NTP runs on port 123
-    Udp.beginPacket(address, 123);
+    Udp.beginPacket(TIME_SERVER, NTP_PORT);
     Udp.write(packetBuffer, NTP_PACKET_SIZE);
     Udp.endPacket();
 }
